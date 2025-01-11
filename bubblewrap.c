@@ -3237,15 +3237,16 @@ main (int    argc,
       /* Discover namespace ids before we drop privileges */
       namespace_ids_read (pid);
 
-      if (custom_uid_maps.n > 0 && opt_unshare_user && opt_userns_block_fd == -1)
+      if (getuid() != 0 && custom_uid_maps.n > 0 && opt_unshare_user && opt_userns_block_fd == -1)
         {
           char* cmd = xasprintf("newuidmap %d ", pid);
           for (size_t i_map_entry = 0; i_map_entry < custom_uid_maps.n; i_map_entry++)
             {
               const IdMap* map_entry = &custom_uid_maps.data[i_map_entry];
-              const char* piece = xasprintf("%d %d %d ", map_entry->inner_uid, map_entry->outer_uid, map_entry->count);
+              char* piece = xasprintf("%d %d %d ", map_entry->inner_uid, map_entry->outer_uid, map_entry->count);
               cmd = realloc(cmd, strlen(cmd) + strlen(piece) + 1);
               strcat(cmd, piece);
+              free(piece);
             }
           if (system(cmd) != 0)
             {
@@ -3253,15 +3254,37 @@ main (int    argc,
             }
           free(cmd);
         }
-      if (custom_gid_maps.n > 0 && opt_unshare_user && opt_userns_block_fd == -1)
+      else if (getuid() == 0 && custom_uid_maps.n > 0 && opt_unshare_user && opt_userns_block_fd == -1)
+        {
+          char* uid_map = calloc(1, 1);
+          for (size_t i_map_entry = 0; i_map_entry < custom_uid_maps.n; i_map_entry++)
+            {
+              const IdMap* map_entry = &custom_uid_maps.data[i_map_entry];
+              char* line = xasprintf("%d %d %d\n", map_entry->inner_uid, map_entry->outer_uid, map_entry->count);
+              uid_map = realloc(uid_map, strlen(uid_map) + strlen(line) + 1);
+              strcat(uid_map, line);
+              free(line);
+            }
+          const char* uid_map_file = xasprintf("/proc/%d/uid_map", pid);
+          int uid_map_fd = open(uid_map_file, O_WRONLY);
+          if (write(uid_map_fd, uid_map, strlen(uid_map)) == -1)
+            {
+              perror("Could not write to uid_map file");
+              exit(1);
+            }
+          close(uid_map_fd);
+          free(uid_map);
+        }
+      if (getuid() != 0 && custom_gid_maps.n > 0 && opt_unshare_user && opt_userns_block_fd == -1)
         {
           char* cmd = xasprintf("newgidmap %d ", pid);
           for (size_t i_map_entry = 0; i_map_entry < custom_gid_maps.n; i_map_entry++)
             {
               const IdMap* map_entry = &custom_gid_maps.data[i_map_entry];
-              const char* piece = xasprintf("%d %d %d ", map_entry->inner_uid, map_entry->outer_uid, map_entry->count);
+              char* piece = xasprintf("%d %d %d ", map_entry->inner_uid, map_entry->outer_uid, map_entry->count);
               cmd = realloc(cmd, strlen(cmd) + strlen(piece) + 1);
               strcat(cmd, piece);
+              free(piece);
             }
           if (system(cmd) != 0)
             {
@@ -3269,6 +3292,28 @@ main (int    argc,
             }
           free(cmd);
         }
+      else if (getuid() == 0 && custom_gid_maps.n > 0 && opt_unshare_user && opt_userns_block_fd == -1)
+        {
+          char* gid_map = calloc(1, 1);
+          for (size_t i_map_entry = 0; i_map_entry < custom_gid_maps.n; i_map_entry++)
+            {
+              const IdMap* map_entry = &custom_uid_maps.data[i_map_entry];
+              char* line = xasprintf("%d %d %d\n", map_entry->inner_uid, map_entry->outer_uid, map_entry->count);
+              gid_map = realloc(gid_map, strlen(gid_map) + strlen(line) + 1);
+              strcat(gid_map, line);
+              free(line);
+            }
+          const char* gid_map_file = xasprintf("/proc/%d/gid_map", pid);
+          int gid_map_fd = open(gid_map_file, O_WRONLY);
+          if (write(gid_map_fd, gid_map, strlen(gid_map)) == -1)
+            {
+              perror("Could not write to uid_map file");
+              exit (1);
+            }
+          close(gid_map_fd);
+          free(gid_map);
+        }
+
       if (prctl (PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
         die_with_error ("prctl(PR_SET_NO_NEW_PRIVS) failed");
 
