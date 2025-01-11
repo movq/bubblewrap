@@ -80,7 +80,6 @@ static bool opt_new_session = false;
 static bool opt_die_with_parent = false;
 static bool opt_net_pasta = false;
 static bool opt_net_slirp = false;
-static bool opt_map_uids = false;
 static uid_t opt_sandbox_uid = -1;
 static gid_t opt_sandbox_gid = -1;
 static int opt_sync_fd = -1;
@@ -302,6 +301,44 @@ seccomp_programs_apply (void)
     }
 }
 
+typedef struct
+{
+  int inner_uid;
+  int outer_uid;
+  int count;
+} IdMap;
+
+typedef struct
+{
+  IdMap* data;
+  size_t n;
+  size_t max;
+} IdMapArray;
+
+static void
+id_map_array_init (IdMapArray *array)
+{
+  array->n = 0;
+  array->max = 4;
+  array->data = malloc(sizeof(IdMap) * array->max);
+}
+
+static void
+id_map_array_append (IdMapArray *array, IdMap value)
+{
+  if (array->n >= array->max)
+    {
+      size_t newmax = array->max * 2;
+      array->data = realloc(array->data, newmax);
+      array->max = newmax;
+    }
+  array->data[array->n] = value;
+  array->n++;
+}
+
+static IdMapArray custom_uid_maps;
+static IdMapArray custom_gid_maps;
+
 static void
 usage (int ecode, FILE *out)
 {
@@ -378,7 +415,8 @@ usage (int ecode, FILE *out)
            "    --chmod OCTAL PATH           Change permissions of PATH (must already exist)\n"
            "    --net-pasta                  Setup networking using pasta (requires --unshare-net)\n"
            "    --net-slirp                  Setup networking using slirp4netns (requires --unshare-net)\n"
-           "    --map-uids                   Create custom UID mappings\n"
+           "    --uid-map INNER OUTER COUNT  Add custom UID mapping\n"
+           "    --gid-map INNER OUTER COUNT  Add custom GID mapping\n"
           );
   exit (ecode);
 }
@@ -2755,9 +2793,31 @@ parse_args_recurse (int          *argcp,
           opt_net_slirp = true;
         }
 
-      else if (strcmp (arg, "--map-uids") == 0)
+      else if (strcmp (arg, "--uid-map") == 0)
         {
-          opt_map_uids = true;
+          if (argc < 4)
+            die("--uid-map takes 3 arguments");
+          IdMap map;
+          map.inner_uid = atoi(argv[1]);
+          map.outer_uid = atoi(argv[2]);
+          map.count = atoi(argv[3]);
+
+          id_map_array_append(&custom_uid_maps, map);
+          argv += 3;
+          argc -= 3;
+        }
+      else if (strcmp (arg, "--gid-map") == 0)
+        {
+          if (argc < 4)
+            die("--gid-map takes 3 arguments");
+          IdMap map;
+          map.inner_uid = atoi(argv[1]);
+          map.outer_uid = atoi(argv[2]);
+          map.count = atoi(argv[3]);
+
+          id_map_array_append(&custom_gid_maps, map);
+          argv += 3;
+          argc -= 3;
         }
       else if (strcmp (arg, "--") == 0)
         {
@@ -2913,6 +2973,9 @@ main (int    argc,
   int intermediate_pids_sockets[2] = {-1, -1};
   const char *exec_path = NULL;
   int i;
+
+  id_map_array_init(&custom_uid_maps);
+  id_map_array_init(&custom_gid_maps);
 
   /* Handle --version early on before we try to acquire/drop
    * any capabilities so it works in a build environment;
@@ -3174,23 +3237,43 @@ main (int    argc,
       /* Discover namespace ids before we drop privileges */
       namespace_ids_read (pid);
 
-      if (opt_map_uids && opt_unshare_user && opt_userns_block_fd == -1)
+      if (custom_uid_maps.n > 0 && opt_unshare_user && opt_userns_block_fd == -1)
         {
-          const char* cmd = xasprintf("newuidmap %d 0 100000 1000 1000 1000 1 1001 101000 64536", pid);
+          char* cmd = xasprintf("newuidmap %d ", pid);
+          for (size_t i_map_entry = 0; i_map_entry < custom_uid_maps.n; i_map_entry++)
+            {
+              const IdMap* map_entry = &custom_uid_maps.data[i_map_entry];
+              const char* piece = xasprintf("%d %d %d ", map_entry->inner_uid, map_entry->outer_uid, map_entry->count);
+              cmd = realloc(cmd, strlen(cmd) + strlen(piece) + 1);
+              strcat(cmd, piece);
+            }
           if (system(cmd) != 0)
             {
               die_with_error ("newuidmap failed\n");
             }
-          cmd = xasprintf("newgidmap %d 0 100000 1000 1000 1000 1 1001 101000 64536", pid);
+          free(cmd);
+        }
+      if (custom_gid_maps.n > 0 && opt_unshare_user && opt_userns_block_fd == -1)
+        {
+          char* cmd = xasprintf("newgidmap %d ", pid);
+          for (size_t i_map_entry = 0; i_map_entry < custom_gid_maps.n; i_map_entry++)
+            {
+              const IdMap* map_entry = &custom_gid_maps.data[i_map_entry];
+              const char* piece = xasprintf("%d %d %d ", map_entry->inner_uid, map_entry->outer_uid, map_entry->count);
+              cmd = realloc(cmd, strlen(cmd) + strlen(piece) + 1);
+              strcat(cmd, piece);
+            }
           if (system(cmd) != 0)
             {
               die_with_error ("newgidmap failed\n");
             }
+          free(cmd);
         }
       if (prctl (PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
         die_with_error ("prctl(PR_SET_NO_NEW_PRIVS) failed");
 
-      if (is_privileged && !opt_map_uids && opt_unshare_user && opt_userns_block_fd == -1)
+      bool should_write_maps = custom_uid_maps.n == 0 && custom_gid_maps.n == 0;
+      if (is_privileged && should_write_maps && opt_unshare_user && opt_userns_block_fd == -1)
         {
           /* We're running as euid 0, but the uid we want to map is
            * not 0. This means we're not allowed to write this from
@@ -3220,9 +3303,6 @@ main (int    argc,
           exit(1);
         if (sub_pid == 0)
         {
-          if (opt_net_slirp)
-            close(slirp_finished_pipe[1]); // close write-end
-
           unblock_sigchild();
           const char* pid_str = xasprintf("%d", pid);
           if (opt_net_pasta)
@@ -3231,12 +3311,12 @@ main (int    argc,
             }
           else if (opt_net_slirp)
             {
-              int new_fd = dup(slirp_finished_pipe[0]);
-              const char* new_fd_str = xasprintf("%d", new_fd);
+              const char* new_fd_str = xasprintf("%d", slirp_finished_pipe[0]);
               int null_fd = open("/dev/null", O_WRONLY);
               dup2(null_fd, 1);
               dup2(null_fd, 2);
               close(null_fd);
+              close(slirp_finished_pipe[1]); // close write-end
               execlp("slirp4netns", "slirp4netns", "--exit-fd", new_fd_str, "--configure", "--mtu=65520", "--disable-host-loopback", "-6", pid_str, "eth0", NULL);
             }
           exit(0);
@@ -3342,7 +3422,7 @@ main (int    argc,
 
   ns_uid = opt_sandbox_uid;
   ns_gid = opt_sandbox_gid;
-  if (!is_privileged && !opt_map_uids && opt_unshare_user && opt_userns_block_fd == -1)
+  if (!is_privileged && custom_uid_maps.n == 0 && opt_unshare_user && opt_userns_block_fd == -1)
     {
       /* In the unprivileged case we have to write the uid/gid maps in
        * the child, because we have no caps in the parent */
